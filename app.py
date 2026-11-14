@@ -1,38 +1,24 @@
-"""ORION Asset Integrity Console for machining cell MC-01."""
-
 from __future__ import annotations
 
+import json
 import time
-from pathlib import Path
 
 import joblib
-import numpy as np
 import pandas as pd
-import plotly.graph_objects as go
 import streamlit as st
-from plotly.subplots import make_subplots
-from scipy.stats import norm
 
-ROOT = Path(__file__).resolve().parent
-CORE_PATH = ROOT / "models" / "horizon_stacking_pipeline.pkl"
-STREAM_PATH = ROOT / "data" / "raw" / "live_telemetry_stream.csv"
+import charts
+from src import eda
+from src.data import MODEL_PATH, RAW_PATH, REPORT_PATH, STREAM_PATH, load_raw
+from src.monitoring import PSI_ALERT, PSI_CLEAR, AlertPolicy, AlertValidator, population_stability_index
 
-HIGHLIGHTS = {"Tool_Wear_Strain_Index", "Mechanical_Power_kW"}
-DISPLAY_NAMES = {
-    "Air temperature [K]": "Air Temperature",
-    "Process temperature [K]": "Process Temperature",
-    "Rotational speed [rpm]": "Rotational Speed",
-    "Torque [Nm]": "Torque",
-    "Tool wear [min]": "Tool Wear",
-    "Mechanical_Power_kW": "Mechanical Power",
-    "Thermal_Stress_K": "Thermal Stress",
-    "Tool_Wear_Strain_Index": "Tool Wear Strain Index",
-    "Type_L": "Variant L",
-    "Type_M": "Variant M",
-    "Type_H": "Variant H",
-}
+NAVIGATION = ["📊 Exploratory Data Analysis", "🧪 Model Evaluation", "📡 Active Asset Telemetry"]
 DRIFT_MESSAGE = "Data Drift Detected: Sensor Recalibration Recommended."
-NAVIGATION = ["📡 Active Asset Telemetry", "📊 Diagnostic Architecture"]
+INTERVALS = [0.25, 0.5, 1.0, 2.0]
+LEVEL_COLORS = ["#2FCE8B", "#E6A23C", "#EF5B4C"]
+VERIFY_COLOR = "#4CC9F0"
+STANDBY_COLOR = "#8EA0B3"
+TRAIL = 40
 
 THEME = """
 <style>
@@ -44,11 +30,8 @@ THEME = """
             linear-gradient(180deg, #0B1117 0%, #0A1016 100%);
         color: #E6EDF3;
     }
-    section[data-testid="stSidebar"] {
-        background: #0E1620;
-        border-right: 1px solid #243140;
-    }
-    .block-container { padding-top: 1.1rem; padding-bottom: 1.4rem; max-width: 1440px; }
+    section[data-testid="stSidebar"] { background: #0E1620; border-right: 1px solid #243140; }
+    .block-container { padding-top: 1.1rem; padding-bottom: 1.4rem; max-width: 1480px; }
     .brand-block { padding: 0.2rem 0 0.8rem 0; border-bottom: 1px solid #243140; margin-bottom: 0.8rem; }
     .brand-kicker { color: #2EC4B6; letter-spacing: 0.22em; font-size: 0.72rem; font-weight: 700; }
     .brand-title { color: #E6EDF3; font-size: 1.15rem; font-weight: 650; margin-top: 0.15rem; }
@@ -65,32 +48,21 @@ THEME = """
     .mast-kicker { color: #2EC4B6; letter-spacing: 0.2em; font-size: 0.72rem; font-weight: 700; }
     .mast-title { font-size: 1.55rem; font-weight: 650; line-height: 1.15; color: #F4F7FA; }
     .mast-meta { text-align: right; color: #8EA0B3; font-size: 0.82rem; letter-spacing: 0.04em; }
-    .kpi-card { background: #101820; border: 1px solid #243140; padding: 0.85rem 1rem 0.75rem 1rem; min-height: 108px; }
-    .kpi-label { color: #8EA0B3; font-size: 0.75rem; letter-spacing: 0.08em; text-transform: uppercase; }
-    .kpi-value { color: #F4F7FA; font-family: Consolas, "Segoe UI", monospace; font-size: 2rem; font-weight: 650; line-height: 1.2; margin-top: 0.25rem; }
+    .kpi-card { background: #101820; border: 1px solid #243140; padding: 0.8rem 1rem 0.7rem 1rem; min-height: 96px; margin-bottom: 0.6rem; }
+    .kpi-label { color: #8EA0B3; font-size: 0.72rem; letter-spacing: 0.08em; text-transform: uppercase; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .kpi-value { color: #F4F7FA; font-family: Consolas, "Segoe UI", monospace; font-size: clamp(1.1rem, 1.9vw, 1.75rem); font-weight: 650; line-height: 1.2; margin-top: 0.25rem; white-space: nowrap; }
     .status-banner, .drift-banner {
         display: flex; align-items: center; gap: 0.7rem;
         background: #101820; border: 1px solid #243140; border-left: 4px solid #5C6B7A;
-        padding: 0.75rem 0.9rem; margin: 0.35rem 0 0.8rem 0;
-        font-weight: 650; letter-spacing: 0.02em;
+        padding: 0.75rem 0.9rem; margin: 0.35rem 0 0.8rem 0; font-weight: 650; letter-spacing: 0.02em;
     }
     .status-lamp { width: 10px; height: 10px; border-radius: 50%; display: inline-block; box-shadow: 0 0 10px currentColor; }
-    .section-kicker { color: #8EA0B3; letter-spacing: 0.16em; font-size: 0.72rem; font-weight: 700; }
-    .section-copy { color: #C5D0DB; font-size: 0.95rem; margin: 0.25rem 0 0.55rem 0; }
-    div[data-testid="stPlotlyChart"] {
-        background: #101820;
-        border: 1px solid #243140;
-        padding: 0.15rem 0.15rem 0 0.15rem;
-    }
+    .section-kicker { color: #8EA0B3; letter-spacing: 0.16em; font-size: 0.72rem; font-weight: 700; margin: 0.6rem 0 0.3rem 0; text-transform: uppercase; }
+    .side-value { font-family: Consolas, "Segoe UI", monospace; font-size: clamp(0.95rem, 1.4vw, 1.35rem); font-weight: 650; margin-bottom: 0.9rem; white-space: nowrap; }
+    div[data-testid="stPlotlyChart"] { background: #101820; border: 1px solid #243140; padding: 0.15rem 0.15rem 0 0.15rem; }
     .stButton > button {
-        background: #123F3B;
-        color: #E8FFF9;
-        border: 1px solid #2EC4B6;
-        border-radius: 2px;
-        font-weight: 700;
-        letter-spacing: 0.04em;
-        height: 2.7rem;
-        width: 100%;
+        background: #123F3B; color: #E8FFF9; border: 1px solid #2EC4B6; border-radius: 2px;
+        font-weight: 700; letter-spacing: 0.04em; height: 2.7rem; width: 100%;
     }
     .stButton > button:hover { background: #176159; border-color: #7EE0D6; color: white; }
     div[data-testid="stSidebar"] .stRadio label { color: #E6EDF3; }
@@ -98,249 +70,51 @@ THEME = """
 """
 
 
-def apply_theme() -> None:
-    st.markdown(THEME, unsafe_allow_html=True)
-
-
-def population_stability_index(
-    window: list[float],
-    mean: float,
-    std: float,
-    z_edges: np.ndarray,
-) -> float:
-    """Compare the live 40-cycle power window with the commissioned mean and spread."""
-    if len(window) < 40 or std <= 1e-9:
-        return 0.0
-    expected = np.diff(norm.cdf(np.asarray(z_edges, dtype=float)))
-    z_scores = (np.asarray(window[-40:], dtype=float) - mean) / std
-    counts, _ = np.histogram(z_scores, bins=np.asarray(z_edges, dtype=float))
-    actual = counts.astype(float) + 0.5
-    actual /= actual.sum()
-    reference = np.clip(expected, 1e-6, None)
-    reference /= reference.sum()
-    return float(np.sum((actual - reference) * np.log(actual / reference)))
-
-
-def risk_status(percent: float) -> tuple[str, str]:
-    if percent < 40:
-        return "STATUS: SYSTEM OPTIMAL", "#2FCE8B"
-    if percent <= 75:
-        return "WARNING: DEGRADATION DETECTED. Inspect within 5 cycles", "#E6A23C"
-    return "CRITICAL SHUTDOWN RISK", "#EF5B4C"
+def stamp(path) -> float:
+    return path.stat().st_mtime if path.exists() else 0.0
 
 
 @st.cache_resource
-def load_core():
-    if not CORE_PATH.exists():
+def load_core(version: float):
+    if not MODEL_PATH.exists():
         return None
-    return joblib.load(CORE_PATH)
+    core = joblib.load(MODEL_PATH)
+    return core if hasattr(core, "alert_policy_") else None
 
 
-def score_cycle(core, row: pd.Series) -> float:
-    columns = list(core.feature_columns_)
-    payload = pd.DataFrame(
-        [row.reindex(columns).to_numpy(dtype=float)],
-        columns=columns,
-    )
-    scored = core.predict_proba(payload)
-    return float(scored[0, 1])
+@st.cache_data
+def load_report(version: float):
+    if not REPORT_PATH.exists():
+        return None
+    return json.loads(REPORT_PATH.read_text(encoding="utf-8"))
 
 
-def _layout(figure: go.Figure, height: int) -> go.Figure:
-    figure.update_layout(
-        height=height,
-        paper_bgcolor="rgba(0,0,0,0)",
-        plot_bgcolor="rgba(0,0,0,0)",
-        font={"family": "Segoe UI, Bahnschrift, sans-serif", "color": "#E6EDF3", "size": 13},
-        margin={"l": 58, "r": 58, "t": 36, "b": 48},
-        legend={
-            "orientation": "h",
-            "yanchor": "bottom",
-            "y": 1.02,
-            "x": 0,
-            "bgcolor": "rgba(0,0,0,0)",
-        },
-        hoverlabel={"bgcolor": "#121A22", "bordercolor": "#243140", "font": {"color": "#E6EDF3"}},
-    )
-    figure.update_xaxes(gridcolor="#1C2834", zerolinecolor="#1C2834", linecolor="#243140")
-    figure.update_yaxes(gridcolor="#1C2834", zerolinecolor="#1C2834", linecolor="#243140")
-    return figure
+@st.cache_data
+def eda_bundle(version: float) -> dict:
+    frame = eda.load_frame()
+    return {
+        "frame": frame,
+        "overview": eda.overview(load_raw()),
+        "balance": eda.class_balance(frame),
+        "separation": eda.class_separation(frame),
+        "segments": eda.segment_modes(frame),
+        "splits": eda.split_profile(),
+    }
 
 
-def build_gauge(percent: float, color: str, standby: bool) -> go.Figure:
-    bar = "#5C6B7A" if standby else color
-    figure = go.Figure(
-        go.Indicator(
-            mode="gauge+number",
-            value=0 if standby else percent,
-            number={
-                "suffix": "%" if not standby else "",
-                "font": {"color": bar, "size": 42, "family": "Consolas, Segoe UI, monospace"},
-                "valueformat": ".1f" if not standby else ".0f",
-            },
-            title={"text": "Asset Health Index", "font": {"size": 16, "color": "#8EA0B3"}},
-            gauge={
-                "axis": {
-                    "range": [0, 100],
-                    "tickwidth": 1,
-                    "tickcolor": "#8EA0B3",
-                    "tickfont": {"color": "#8EA0B3"},
-                },
-                "bar": {"color": bar, "thickness": 0.28},
-                "bgcolor": "#0B1117",
-                "borderwidth": 0,
-                "steps": [
-                    {"range": [0, 40], "color": "#143028"},
-                    {"range": [40, 75], "color": "#3A2E14"},
-                    {"range": [75, 100], "color": "#3A1818"},
-                ],
-                "threshold": {
-                    "line": {"color": bar, "width": 3},
-                    "thickness": 0.8,
-                    "value": 0 if standby else percent,
-                },
-            },
-        )
-    )
-    figure.update_layout(
-        height=340,
-        paper_bgcolor="rgba(0,0,0,0)",
-        margin={"l": 24, "r": 24, "t": 48, "b": 12},
-        font={"color": "#E6EDF3", "family": "Segoe UI, Bahnschrift, sans-serif"},
-    )
-    return figure
+def chart(figure, key: str) -> None:
+    st.plotly_chart(figure, width="stretch", config={"displaylogo": False}, key=key)
 
 
-def build_trend(cycles: list, torque: list, power: list, standby: bool) -> go.Figure:
-    figure = make_subplots(specs=[[{"secondary_y": True}]])
-    figure.add_trace(
-        go.Scatter(
-            x=cycles,
-            y=torque,
-            name="Torque",
-            mode="lines",
-            line={"color": "#4CC9F0", "width": 2.2},
-            hovertemplate="Cycle %{x}<br>Torque %{y:.2f} Nm<extra></extra>",
-        ),
-        secondary_y=False,
-    )
-    figure.add_trace(
-        go.Scatter(
-            x=cycles,
-            y=power,
-            name="Mechanical Power",
-            mode="lines",
-            line={"color": "#F0A202", "width": 2.2},
-            hovertemplate="Cycle %{x}<br>Mechanical Power %{y:.2f} kW<extra></extra>",
-        ),
-        secondary_y=True,
-    )
-    figure.update_yaxes(title_text="Torque (Nm)", secondary_y=False, color="#4CC9F0")
-    figure.update_yaxes(title_text="Mechanical Power (kW)", secondary_y=True, color="#F0A202")
-    figure.update_xaxes(title_text="Cycle ID")
-    _layout(figure, 430)
-    figure.update_layout(title={"text": "Torque and Mechanical Power — Last 40 Cycles", "x": 0})
-    if standby:
-        figure.add_annotation(
-            text="Awaiting sensor stream",
-            showarrow=False,
-            font={"color": "#8EA0B3", "size": 16},
-        )
-    return figure
+def kpi_card(label: str, value) -> str:
+    return f'<div class="kpi-card"><div class="kpi-label">{label}</div><div class="kpi-value">{value}</div></div>'
 
 
-def build_validation(core) -> go.Figure:
-    def _ordered(recall: np.ndarray, precision: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-        order = np.argsort(np.asarray(recall))
-        return np.asarray(recall)[order], np.asarray(precision)[order]
-
-    core_recall, core_precision = _ordered(
-        core.historical_recall_core_,
-        core.historical_precision_core_,
-    )
-    legacy_recall, legacy_precision = _ordered(
-        core.historical_recall_legacy_,
-        core.historical_precision_legacy_,
-    )
-    figure = go.Figure()
-    figure.add_trace(
-        go.Scatter(
-            x=legacy_recall,
-            y=legacy_precision,
-            name="Legacy Rule Engine",
-            mode="lines",
-            line={"color": "#8EA0B3", "width": 2, "dash": "dash"},
-            fill="tozeroy",
-            fillcolor="rgba(142, 160, 179, 0.20)",
-            hovertemplate="Recall %{x:.2f}<br>Precision %{y:.2f}<extra>Legacy Rule Engine</extra>",
-        )
-    )
-    figure.add_trace(
-        go.Scatter(
-            x=core_recall,
-            y=core_precision,
-            name="Autonomous Diagnostic Core",
-            mode="lines",
-            line={"color": "#2EC4B6", "width": 2.6},
-            fill="tozeroy",
-            fillcolor="rgba(46, 196, 182, 0.28)",
-            hovertemplate="Recall %{x:.2f}<br>Precision %{y:.2f}<extra>Autonomous Diagnostic Core</extra>",
-        )
-    )
-    _layout(figure, 480)
-    figure.update_xaxes(title_text="Recall", range=[-0.02, 1.02])
-    figure.update_yaxes(title_text="Precision", range=[-0.02, 1.02])
-    return figure
-
-
-def build_influence(core) -> go.Figure:
-    names = list(core.feature_columns_)
-    values = np.asarray(
-        core.named_steps["core"].named_estimators_["trees"].feature_importances_,
-        dtype=float,
-    )
-    order = np.argsort(values)
-    ordered_names = [names[index] for index in order]
-    ordered_values = values[order]
-    colors = ["#F0A202" if name in HIGHLIGHTS else "#3E6F8E" for name in ordered_names]
-    labels = [DISPLAY_NAMES.get(name, name.replace("_", " ")) for name in ordered_names]
-    figure = go.Figure(
-        go.Bar(
-            x=ordered_values,
-            y=labels,
-            orientation="h",
-            marker={"color": colors, "line": {"width": 0}},
-            hovertemplate="%{y}<br>Relative influence %{x:.1%}<extra></extra>",
-        )
-    )
-    _layout(figure, 520)
-    figure.update_layout(margin={"l": 180, "r": 40, "t": 36, "b": 48}, showlegend=False)
-    figure.update_xaxes(title_text="Relative Influence", tickformat=".0%")
-    return figure
-
-
-def masthead() -> None:
-    st.markdown(
-        """
-        <div class="masthead">
-            <div>
-                <div class="mast-kicker">ORION AIS</div>
-                <div class="mast-title">Asset Integrity Console</div>
-            </div>
-            <div class="mast-meta">CELL MC-01<br>MACHINING LINE · ROTATING ASSEMBLY</div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
-
-def kpi_card(label: str, value: str) -> str:
-    return (
-        '<div class="kpi-card">'
-        f'<div class="kpi-label">{label}</div>'
-        f'<div class="kpi-value">{value}</div>'
-        "</div>"
-    )
+def tiles(items: list[tuple[str, object]], per_row: int = 4) -> None:
+    for start in range(0, len(items), per_row):
+        row = items[start:start + per_row]
+        for column, (label, value) in zip(st.columns(per_row), row):
+            column.markdown(kpi_card(label, value), unsafe_allow_html=True)
 
 
 def banner(text: str, color: str, drifted: bool = False) -> str:
@@ -352,170 +126,293 @@ def banner(text: str, color: str, drifted: bool = False) -> str:
     )
 
 
-def render_frame(
-    stage,
-    *,
-    cycle: str,
-    power: str,
-    thermal: str,
-    percent: float,
-    status: str,
-    color: str,
-    cycles: list,
-    torque: list,
-    power_series: list,
-    drifted: bool,
-    standby: bool,
-) -> None:
-    with stage.container():
-        left, middle, right = st.columns(3)
-        left.markdown(kpi_card("Cycle ID", cycle), unsafe_allow_html=True)
-        middle.markdown(kpi_card("Mechanical Power (kW)", power), unsafe_allow_html=True)
-        right.markdown(kpi_card("Thermal Stress (K)", thermal), unsafe_allow_html=True)
-        st.markdown(banner(status, "#8EA0B3" if standby else color), unsafe_allow_html=True)
-        if drifted:
-            st.markdown(banner(DRIFT_MESSAGE, "#E6A23C", drifted=True), unsafe_allow_html=True)
+def masthead(title: str) -> None:
+    st.markdown(
+        f"""
+        <div class="masthead">
+            <div>
+                <div class="mast-kicker">ORION AIS</div>
+                <div class="mast-title">{title}</div>
+            </div>
+            <div class="mast-meta">CELL MC-01<br>MACHINING LINE · ROTATING ASSEMBLY</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
 
-        context, gauge_col, alignment = st.columns([1, 2.1, 1])
+
+def page_eda() -> None:
+    masthead("Exploratory Data Analysis")
+    data = eda_bundle(stamp(RAW_PATH))
+    summary = data["overview"]
+    tiles(
+        [
+            ("Cycles", f"{summary['rows']:,}"),
+            ("Failures", summary["failures"]),
+            ("Imbalance", f"1 : {summary['imbalance_ratio']:.0f}"),
+            ("Missing", summary["missing_values"]),
+            ("Duplicates", summary["duplicate_rows"]),
+        ],
+        per_row=5,
+    )
+    left, right = st.columns([1, 1.4])
+    with left:
+        chart(charts.class_donut(data["balance"]), "eda-balance")
+    with right:
+        chart(charts.separation_bar(data["separation"]), "eda-separation")
+    chart(charts.power_map(data["frame"]), "eda-power")
+    left, right = st.columns(2)
+    with left:
+        chart(charts.segment_stack(data["segments"]), "eda-segments")
+    with right:
+        chart(charts.split_chart(data["splits"]), "eda-splits")
+
+
+def page_models(report) -> None:
+    masthead("Model Evaluation")
+    if report is None:
+        st.markdown(banner("Evaluation report not found. Run python -m src.train_pipeline.", "#EF5B4C"), unsafe_allow_html=True)
+        return
+    thresholds = report["thresholds"]
+    validated = report["alerts"]["holdout"]["validated"]
+    tiles(
+        [
+            ("Prediction Horizon", f"{report['horizon']} cycles"),
+            ("Warning Threshold", f"{thresholds['warning']:.3f}"),
+            ("Critical Threshold", f"{thresholds['critical']:.3f}"),
+            ("Failures Warned", f"{validated['warned']} / {validated['failure_events']}"),
+        ]
+    )
+    left, right = st.columns(2)
+    with left:
+        chart(charts.baseline_bars(report["comparison"]), "model-baseline")
+    with right:
+        chart(charts.pr_curves(report["curves"], report["comparison"]), "model-pr")
+    chart(charts.confusion_pair(report["confusion"]), "model-confusion")
+    left, right = st.columns(2)
+    with left:
+        chart(charts.horizon_chart(report["horizons"], report["horizon"]), "model-horizon")
+    with right:
+        chart(charts.alert_chart(report["alerts"]), "model-alerts")
+
+
+def status_text(state: dict, policy: AlertPolicy, horizon: int) -> tuple[str, str]:
+    level = state["level"]
+    if level == 2:
+        text = "CRITICAL: FAILURE RISK CONFIRMED"
+    elif level == 1:
+        text = f"WARNING: DEGRADATION CONFIRMED · INSPECT WITHIN {horizon} CYCLES"
+    else:
+        text = "STATUS: SYSTEM OPTIMAL"
+    if state["rising"]:
+        text += f" · VERIFYING FLAG {state['rising']}/{policy.confirm}"
+    if state["falling"]:
+        text += f" · RECOVERY CHECK {state['falling']}/{policy.release}"
+    return text, VERIFY_COLOR if state["rising"] and level == 0 else LEVEL_COLORS[level]
+
+
+def validation_label(state: dict, policy: AlertPolicy) -> tuple[str, str]:
+    if state["rising"]:
+        return f"VERIFYING {state['rising']}/{policy.confirm}", VERIFY_COLOR
+    if state["falling"]:
+        return f"RELEASING {state['falling']}/{policy.release}", LEVEL_COLORS[1]
+    if state["level"]:
+        return "CONFIRMED", LEVEL_COLORS[state["level"]]
+    return "CLEAR", LEVEL_COLORS[0]
+
+
+def side_value(label: str, value: str, color: str) -> str:
+    return f'<div class="section-kicker">{label}</div><div class="side-value" style="color:{color};">{value}</div>'
+
+
+def render_frame(stage, view: dict) -> None:
+    standby = view["standby"]
+    key = view["key"]
+    with stage.container():
+        tiles(
+            [("Cycle ID", view["cycle"]), ("Mechanical Power (kW)", view["power"]), ("Thermal Stress (K)", view["thermal"])],
+            per_row=3,
+        )
+        st.markdown(banner(view["status"], STANDBY_COLOR if standby else view["color"]), unsafe_allow_html=True)
+        if view["drifted"]:
+            st.markdown(banner(DRIFT_MESSAGE, LEVEL_COLORS[1], drifted=True), unsafe_allow_html=True)
+
+        context, gauge_column, alignment = st.columns([1, 2.1, 1])
         with context:
             st.markdown(
-                '<div class="section-kicker">Risk Probability</div>'
-                '<div class="section-copy">Continuous index for the current cycle. '
-                "Inspect the assembly if the index leaves the optimal band.</div>",
+                side_value("Model Risk", view["risk"], STANDBY_COLOR)
+                + side_value("Validation", view["validation"], view["validation_color"]),
                 unsafe_allow_html=True,
             )
-        with gauge_col:
-            st.plotly_chart(
-                build_gauge(percent, color, standby),
-                use_container_width=True,
-                config={"displaylogo": False},
-                key=f"asset-health-gauge-{cycle}",
+        with gauge_column:
+            chart(
+                charts.gauge(view["health"], view["color"], standby, view["warning_health"], view["critical_health"]),
+                f"gauge-{key}",
             )
         with alignment:
-            alignment_text = "RECALIBRATION" if drifted else "NOMINAL"
-            alignment_color = "#E6A23C" if drifted else "#2FCE8B"
+            alignment_text, alignment_color = ("RECALIBRATION", LEVEL_COLORS[1]) if view["drifted"] else ("NOMINAL", LEVEL_COLORS[0])
             st.markdown(
-                '<div class="section-kicker">SENSOR ALIGNMENT</div>'
-                f'<div class="kpi-value" style="color:{alignment_color}; font-size:1.4rem;">{alignment_text}</div>'
-                '<div class="section-copy">Mechanical power compared with the commissioned operating window.</div>',
+                side_value("Sensor Alignment", alignment_text, alignment_color) + side_value("PSI", view["psi"], STANDBY_COLOR),
                 unsafe_allow_html=True,
             )
-        st.plotly_chart(
-            build_trend(cycles, torque, power_series, standby),
-            use_container_width=True,
-            config={"displaylogo": False},
-            key=f"torque-power-trend-{cycle}",
+
+        tiles(
+            [
+                ("Raw Flags", view["raw_flags"]),
+                ("Validated Alerts", view["validated_alerts"]),
+                ("Failure Events", view["failures"]),
+                ("Warned In Advance", view["warned"]),
+            ]
         )
+        left, right = st.columns(2)
+        with left:
+            chart(
+                charts.health_trend(
+                    view["cycles"],
+                    view["raw_health"],
+                    view["health_series"],
+                    view["failure_marks"],
+                    view["warning_health"],
+                    view["critical_health"],
+                    standby,
+                ),
+                f"health-{key}",
+            )
+        with right:
+            chart(charts.torque_power_trend(view["cycles"], view["torque"], view["power_series"], standby), f"trend-{key}")
 
 
-def run_stream(core, stage) -> None:
+def standby_view(warning_health: float, critical_health: float) -> dict:
+    return {
+        "key": "standby",
+        "standby": True,
+        "cycle": "—",
+        "power": "—",
+        "thermal": "—",
+        "status": "STATUS: AWAITING TELEMETRY",
+        "color": STANDBY_COLOR,
+        "drifted": False,
+        "risk": "—",
+        "validation": "—",
+        "validation_color": STANDBY_COLOR,
+        "health": 0.0,
+        "psi": "—",
+        "raw_flags": 0,
+        "validated_alerts": 0,
+        "failures": 0,
+        "warned": 0,
+        "cycles": [],
+        "raw_health": [],
+        "health_series": [],
+        "failure_marks": [],
+        "torque": [],
+        "power_series": [],
+        "warning_health": warning_health,
+        "critical_health": critical_health,
+    }
+
+
+def run_stream(core, stage, policy: AlertPolicy, interval: float, warning_health: float, critical_health: float) -> None:
     telemetry = pd.read_csv(STREAM_PATH)
-    cycles: list[int] = []
-    torque: list[float] = []
-    power_series: list[float] = []
+    columns = list(core.feature_columns_)
+    horizon = int(core.horizon_)
+    validator = AlertValidator(policy)
+    history = {key: [] for key in ("cycle", "torque", "power", "raw_health", "health", "level", "failure")}
+    counts = {"raw_flags": 0, "validated_alerts": 0, "failures": 0, "warned": 0}
+    previous_raw = previous_level = 0
     drift_latched = False
 
     for _, row in telemetry.iterrows():
-        cycles.append(int(row["Cycle_ID"]))
-        torque.append(float(row["Torque [Nm]"]))
-        power_series.append(float(row["Mechanical_Power_kW"]))
-        risk = score_cycle(core, row)
-        percent = risk * 100.0
-        status, color = risk_status(percent)
-        psi = population_stability_index(
-            power_series,
-            float(core.power_reference_mean_),
-            float(core.power_reference_std_),
-            np.asarray(core.power_reference_z_edges_, dtype=float),
-        )
-        drifted = psi > 0.25
+        risk = float(core.predict_proba(row[columns].to_numpy(dtype=float).reshape(1, -1))[0, 1])
+        state = validator.step(risk)
+        failure = int(row.get("Failure_Event", 0))
+        if failure:
+            counts["failures"] += 1
+            counts["warned"] += int(any(level >= 1 for level in history["level"][-horizon:]))
+        counts["raw_flags"] += int(state["raw_level"] >= 1 and previous_raw == 0)
+        counts["validated_alerts"] += int(state["level"] >= 1 and previous_level == 0)
+        previous_raw, previous_level = state["raw_level"], state["level"]
+
+        cycle = int(row["Cycle_ID"])
+        health = 100.0 * (1.0 - state["smoothed"])
+        history["cycle"].append(cycle)
+        history["torque"].append(float(row["Torque [Nm]"]))
+        history["power"].append(float(row["Mechanical_Power_kW"]))
+        history["raw_health"].append(100.0 * (1.0 - risk))
+        history["health"].append(health)
+        history["level"].append(state["level"])
+        history["failure"].append(failure)
+
+        psi = population_stability_index(history["power"], core.power_edges_, core.power_expected_)
+        drifted = psi > PSI_ALERT
+        status, color = status_text(state, policy, horizon)
+        validation, validation_color = validation_label(state, policy)
+        recent = slice(-TRAIL, None)
         render_frame(
             stage,
-            cycle=f"{int(row['Cycle_ID']):,}",
-            power=f"{float(row['Mechanical_Power_kW']):.2f}",
-            thermal=f"{float(row['Thermal_Stress_K']):.2f}",
-            percent=percent,
-            status=status,
-            color=color,
-            cycles=cycles[-40:],
-            torque=torque[-40:],
-            power_series=power_series[-40:],
-            drifted=drifted,
-            standby=False,
+            {
+                "key": str(cycle),
+                "standby": False,
+                "cycle": f"{cycle:,}",
+                "power": f"{float(row['Mechanical_Power_kW']):.2f}",
+                "thermal": f"{float(row['Thermal_Stress_K']):.2f}",
+                "status": status,
+                "color": color,
+                "drifted": drifted,
+                "risk": f"{risk:.1%}",
+                "validation": validation,
+                "validation_color": validation_color,
+                "health": health,
+                "psi": f"{psi:.3f}",
+                **counts,
+                "cycles": history["cycle"][recent],
+                "raw_health": history["raw_health"][recent],
+                "health_series": history["health"][recent],
+                "failure_marks": [
+                    (mark_cycle, mark_health)
+                    for mark_cycle, mark_health, mark in zip(history["cycle"][recent], history["health"][recent], history["failure"][recent])
+                    if mark
+                ],
+                "torque": history["torque"][recent],
+                "power_series": history["power"][recent],
+                "warning_health": warning_health,
+                "critical_health": critical_health,
+            },
         )
         if drifted and not drift_latched:
             st.toast(DRIFT_MESSAGE)
             drift_latched = True
-        elif psi <= 0.20:
+        elif psi <= PSI_CLEAR:
             drift_latched = False
-        time.sleep(1.0)
+        time.sleep(interval)
 
 
 def page_telemetry(core) -> None:
-    masthead()
-    command, _spacer = st.columns([1.15, 2.6])
+    masthead("Asset Integrity Console")
+    if core is None:
+        st.markdown(banner("Diagnostic core not commissioned. Run python -m src.train_pipeline.", "#EF5B4C"), unsafe_allow_html=True)
+        return
+    policy = AlertPolicy(**core.alert_policy_)
+    warning_health = 100.0 * (1.0 - policy.warning)
+    critical_health = 100.0 * (1.0 - policy.critical)
+    command, pace, _spacer = st.columns([1.15, 1.0, 1.6], vertical_alignment="bottom")
     with command:
         clicked = st.button("Initiate Sensor Stream", type="primary")
+    with pace:
+        interval = st.select_slider("Cycle Interval (s)", options=INTERVALS, value=1.0)
     stage = st.empty()
     if not STREAM_PATH.exists():
         stage.markdown(banner("Telemetry archive is not commissioned for this cell.", "#EF5B4C"), unsafe_allow_html=True)
         return
     if clicked:
-        run_stream(core, stage)
+        run_stream(core, stage, policy, interval, warning_health, critical_health)
         return
-    render_frame(
-        stage,
-        cycle="—",
-        power="—",
-        thermal="—",
-        percent=0.0,
-        status="STATUS: AWAITING TELEMETRY",
-        color="#8EA0B3",
-        cycles=[],
-        torque=[],
-        power_series=[],
-        drifted=False,
-        standby=True,
-    )
-
-
-def page_architecture(core) -> None:
-    masthead()
-    st.markdown(
-        """
-        <div class="section-kicker">DIAGNOSTIC ARCHITECTURE</div>
-        <div class="section-copy">Historical Validation of the Autonomous Diagnostic Core against the Legacy Rule Engine. The shaded envelope sits above the legacy curve through the primary operating range.</div>
-        """,
-        unsafe_allow_html=True,
-    )
-    st.plotly_chart(
-        build_validation(core),
-        use_container_width=True,
-        config={"displaylogo": False},
-        key="historical-validation",
-    )
-    st.markdown(
-        """
-        <div class="section-kicker">Process Parameters</div>
-        <div class="section-copy">Process Parameter Influence inside the Autonomous Diagnostic Core. Thermal stress and tool wear lead the ranking. Amber bars mark the thermodynamic drivers calculated from torque, speed, and tool wear: mechanical power and tool-wear strain.</div>
-        """,
-        unsafe_allow_html=True,
-    )
-    st.plotly_chart(
-        build_influence(core),
-        use_container_width=True,
-        config={"displaylogo": False},
-        key="process-influence",
-    )
+    render_frame(stage, standby_view(warning_health, critical_health))
 
 
 def main() -> None:
-    st.set_page_config(
-        page_title="ORION Asset Integrity",
-        layout="wide",
-        initial_sidebar_state="expanded",
-    )
-    apply_theme()
+    st.set_page_config(page_title="ORION Asset Integrity", layout="wide", initial_sidebar_state="expanded")
+    st.markdown(THEME, unsafe_allow_html=True)
     st.sidebar.markdown(
         """
         <div class="brand-block">
@@ -527,25 +424,29 @@ def main() -> None:
         unsafe_allow_html=True,
     )
     page = st.sidebar.radio("Navigation", NAVIGATION, label_visibility="collapsed")
+    core = load_core(stamp(MODEL_PATH))
+    report = load_report(stamp(REPORT_PATH))
+    core_status = (
+        f"<b>ONLINE</b><span>Stacked Ensemble · {core.horizon_}-cycle horizon</span>"
+        if core is not None
+        else "<b>OFFLINE</b><span>Not commissioned</span>"
+    )
     st.sidebar.markdown(
-        """
+        f"""
         <div class="side-label">CELL</div>
-        <div class="side-card"><b>MC-01 Turning Module</b><span>Rotating assembly · Plant network connected</span></div>
+        <div class="side-card"><b>MC-01 Turning Module</b><span>Rotating assembly</span></div>
         <div class="side-label">DIAGNOSTIC CORE</div>
-        <div class="side-card"><b>ONLINE</b><span>Autonomous Diagnostic Core commissioned for this cell</span></div>
+        <div class="side-card">{core_status}</div>
         """,
         unsafe_allow_html=True,
     )
 
-    core = load_core()
-    if core is None:
-        st.markdown(banner("The diagnostic core is not commissioned for this cell.", "#EF5B4C"), unsafe_allow_html=True)
-        return
-
     if page == NAVIGATION[0]:
-        page_telemetry(core)
+        page_eda()
+    elif page == NAVIGATION[1]:
+        page_models(report)
     else:
-        page_architecture(core)
+        page_telemetry(core)
 
 
 if __name__ == "__main__":

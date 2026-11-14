@@ -1,385 +1,308 @@
-"""Commission the horizon diagnostic core for the machining-cell console."""
-
 from __future__ import annotations
 
+import itertools
+import json
+import os
+import subprocess
 import sys
 import time
+import warnings
+from datetime import datetime
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
+os.environ.setdefault("PYTHONWARNINGS", "ignore")
 
 import joblib
 import numpy as np
 import pandas as pd
-from scipy.stats import norm
-from sklearn.ensemble import StackingClassifier
-from sklearn.metrics import average_precision_score, precision_recall_curve
-from sklearn.neural_network import MLPClassifier
-from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import StandardScaler
-from sklearn.svm import SVC
-from xgboost import XGBClassifier
+from scipy.optimize import OptimizeWarning
+from sklearn.base import clone
+from sklearn.exceptions import ConvergenceWarning
+from sklearn.metrics import average_precision_score
+from sklearn.model_selection import GridSearchCV
 
-from src.blend import OpeningBlockLogisticRegression
+from src.data import (
+    FEATURE_COLUMNS,
+    HORIZON,
+    HORIZON_GRID,
+    MODEL_PATH,
+    REPORT_PATH,
+    STREAM_PATH,
+    TARGET,
+    chronological_folds,
+    chronological_split,
+    legacy_rule_engine_score,
+    prepare,
+)
+from src.evaluation import at_threshold, best_threshold, pr_curve, summarize
+from src.models import CANDIDATES, build_stack, positive_scores
+from src.monitoring import AlertPolicy, event_metrics, quantile_edges, raw_levels, validate_series
 
-RAW_PATH = ROOT / "data" / "raw" / "ai4i2020.csv"
-STREAM_PATH = ROOT / "data" / "raw" / "live_telemetry_stream.csv"
-MODEL_PATH = ROOT / "models" / "horizon_stacking_pipeline.pkl"
+warnings.filterwarnings("ignore", category=ConvergenceWarning)
+warnings.filterwarnings("ignore", category=OptimizeWarning)
 
-SENSOR_COLUMNS = [
-    "Air temperature [K]",
-    "Process temperature [K]",
-    "Rotational speed [rpm]",
-    "Torque [Nm]",
-    "Tool wear [min]",
-]
-PHYSICS_COLUMNS = [
-    "Mechanical_Power_kW",
-    "Thermal_Stress_K",
-    "Tool_Wear_Strain_Index",
-]
-GRADE_COLUMNS = ["Type_L", "Type_M", "Type_H"]
-FEATURE_COLUMNS = SENSOR_COLUMNS + PHYSICS_COLUMNS + GRADE_COLUMNS
-EVENT_FLAG_COLUMNS = ["Machine failure", "TWF", "HDF", "PWF", "OSF", "RNF"]
-POWER_Z_EDGES = np.array([-np.inf, -1.0, 1.0, np.inf], dtype=float)
-OPENING_BLOCK = 0.25
+STACK_NAME = "Stacked Ensemble"
+LEGACY_NAME = "Legacy Rule Engine"
+BLEND_WINDOWS = [0.25, 0.40, 0.55, 0.65, 0.75]
+ALERT_GRID = {
+    "alpha": [0.4, 0.6, 0.8],
+    "confirm": [2, 3],
+    "release": [2, 3, 4],
+    "hysteresis": [0.8, 0.9],
+}
 
 
-def load_cycles(path: Path) -> pd.DataFrame:
-    """Load plant cycles in time order and remove identifiers plus stale columns."""
-    if not path.exists():
-        raise FileNotFoundError(
-            f"Place ai4i2020.csv in {path.parent} before commissioning the core."
+def plain(value):
+    if isinstance(value, (bool, np.bool_)):
+        return bool(value)
+    if isinstance(value, (int, np.integer)):
+        return int(value)
+    if isinstance(value, (float, np.floating)):
+        return float(value)
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    return str(value)
+
+
+def matrices(frame: pd.DataFrame) -> tuple[np.ndarray, np.ndarray]:
+    return frame[FEATURE_COLUMNS].to_numpy(dtype=float), frame[TARGET].to_numpy(dtype=int)
+
+
+def split_summary(frame: pd.DataFrame) -> dict:
+    return {
+        "rows": int(len(frame)),
+        "positives": int(frame[TARGET].sum()),
+        "base_rate": float(frame[TARGET].mean()),
+        "failure_events": int(frame["Machine failure"].sum()),
+        "first_cycle": int(frame["Cycle_ID"].min()),
+        "last_cycle": int(frame["Cycle_ID"].max()),
+    }
+
+
+def tune_base_learners(x_train, y_train, folds, scale_pos_weight) -> tuple[dict, dict]:
+    tuned, log = {}, {}
+    for name, (factory, grid) in CANDIDATES.items():
+        estimator = factory()
+        if name == "XGBoost":
+            estimator.set_params(scale_pos_weight=scale_pos_weight)
+        search = GridSearchCV(estimator, grid, scoring="average_precision", cv=folds[1:], n_jobs=-1, refit=True)
+        search.fit(x_train, y_train)
+        tuned[name] = search.best_estimator_
+        log[name] = {
+            "best_params": {key.split("__")[-1]: plain(value) for key, value in search.best_params_.items()},
+            "cv_ap": float(search.best_score_),
+        }
+        print(f"  {name:10s} cv AP {search.best_score_:.3f} | {log[name]['best_params']}")
+    return tuned, log
+
+
+def select_blend_window(trees, geometric, folds, x_train, y_train, x_validation, y_validation):
+    best = None
+    for fraction in BLEND_WINDOWS:
+        stack = build_stack(clone(trees), clone(geometric), folds, ignore_fraction=fraction).fit(x_train, y_train)
+        ap = float(average_precision_score(y_validation, positive_scores(stack, x_validation)))
+        print(f"  ignore first {fraction:.0%} | validation AP {ap:.3f}")
+        if best is None or ap > best[2]:
+            best = (stack, fraction, ap)
+    return best[0], best[1]
+
+
+def thresholds_for(y, scores) -> tuple[float, float]:
+    warning = best_threshold(y, scores, beta=2.0)
+    critical = max(best_threshold(y, scores, beta=1.0), warning)
+    return warning, critical
+
+
+def select_alert_policy(scores, failures, warning, critical, horizon) -> AlertPolicy:
+    best, best_key = None, None
+    for alpha, confirm, release, hysteresis in itertools.product(*ALERT_GRID.values()):
+        policy = AlertPolicy(warning, critical, alpha, confirm, release, hysteresis)
+        levels, _ = validate_series(scores, policy)
+        metrics = event_metrics(levels, failures, horizon)
+        key = (metrics["warned"] - metrics["false_episodes"], -metrics["state_changes"], metrics["mean_lead_cycles"])
+        if best_key is None or key > best_key:
+            best, best_key = policy, key
+    return best
+
+
+def alert_summary(scores, failures, policy: AlertPolicy, horizon: int) -> dict:
+    validated, _ = validate_series(scores, policy)
+    return {
+        "raw": event_metrics(raw_levels(scores, policy), failures, horizon),
+        "validated": event_metrics(validated, failures, horizon),
+    }
+
+
+def horizon_study(trees, geometric, policy: AlertPolicy, shipped_stack, ignore_fraction: float) -> list[dict]:
+    rows = []
+    for horizon in HORIZON_GRID:
+        train, validation, holdout = chronological_split(prepare(horizon))
+        x_train, y_train = matrices(train)
+        x_validation, y_validation = matrices(validation)
+        x_holdout, y_holdout = matrices(holdout)
+        if horizon == HORIZON:
+            stack = shipped_stack
+        else:
+            weight = float((y_train == 0).sum() / max((y_train == 1).sum(), 1))
+            stack = build_stack(
+                clone(trees).set_params(scale_pos_weight=weight),
+                clone(geometric),
+                chronological_folds(len(x_train)),
+                ignore_fraction=ignore_fraction,
+            ).fit(x_train, y_train)
+        validation_scores = positive_scores(stack, x_validation)
+        holdout_scores = positive_scores(stack, x_holdout)
+        warning, critical = thresholds_for(y_validation, validation_scores)
+        study_policy = AlertPolicy(warning, critical, policy.alpha, policy.confirm, policy.release, policy.hysteresis)
+        levels, _ = validate_series(holdout_scores, study_policy)
+        events = event_metrics(levels, holdout["Machine failure"].to_numpy(), horizon)
+        row = {
+            "horizon": horizon,
+            "holdout_ap": float(average_precision_score(y_holdout, holdout_scores)),
+            "warned_rate": events["warned_rate"],
+            "lead": events["mean_lead_cycles"],
+            "false_episodes": events["false_episodes"],
+        }
+        rows.append(row)
+        print(
+            f"  horizon {horizon:2d} | holdout AP {row['holdout_ap']:.3f} "
+            f"| warned {row['warned_rate']:.0%} | lead {row['lead']:.1f} | false {row['false_episodes']}"
         )
-
-    frame = pd.read_csv(path)
-    if "UDI" not in frame.columns:
-        raise ValueError("The source archive must include UDI so cycles stay in order.")
-
-    frame = frame.sort_values("UDI").reset_index(drop=True)
-    stale = [
-        column
-        for column in frame.columns
-        if "kmeans" in column.lower() or "rolling_avg" in column.lower()
-    ]
-    frame = frame.drop(columns=stale, errors="ignore")
-    frame["Cycle_ID"] = frame["UDI"].astype(int)
-    return frame.drop(columns=["UDI", "Product ID"], errors="ignore")
-
-
-def add_physics(frame: pd.DataFrame) -> pd.DataFrame:
-    """Vectorized first-principles drivers used by the diagnostic core."""
-    frame = frame.copy()
-    frame["Mechanical_Power_kW"] = (
-        frame["Torque [Nm]"] * frame["Rotational speed [rpm]"] / 9550.0
-    )
-    frame["Thermal_Stress_K"] = (
-        frame["Process temperature [K]"] - frame["Air temperature [K]"]
-    )
-    frame["Tool_Wear_Strain_Index"] = (
-        frame["Mechanical_Power_kW"] * frame["Tool wear [min]"]
-    )
-    return frame
-
-
-def add_horizon_target(frame: pd.DataFrame) -> pd.DataFrame:
-    """Label each cycle if a failure occurs on any of the next five cycles."""
-    frame = frame.copy()
-    failures = frame["Machine failure"].to_numpy()
-    frame["Target_Next_5_Cycles"] = (
-        frame["Machine failure"].shift(-5).rolling(window=5, min_periods=1).max()
-    )
-
-    lookahead = frame["Target_Next_5_Cycles"].to_numpy()
-    for index in range(0, len(frame) - 5, 1000):
-        expected = float(failures[index + 1 : index + 6].max())
-        if lookahead[index] != expected:
-            raise RuntimeError(
-                f"Horizon label mismatch at cycle index {index}: "
-                f"{lookahead[index]} != {expected}"
-            )
-
-    # The last five cycles do not have a complete five-cycle lookahead.
-    frame = frame.iloc[:-5].copy()
-    frame = frame.dropna(subset=["Target_Next_5_Cycles"]).reset_index(drop=True)
-    frame["Target_Next_5_Cycles"] = frame["Target_Next_5_Cycles"].astype(int)
-    return frame
-
-
-def encode_variant(frame: pd.DataFrame) -> pd.DataFrame:
-    frame = frame.copy()
-    grades = pd.get_dummies(frame["Type"].astype(str), prefix="Type", dtype=float)
-    frame = pd.concat([frame.drop(columns=["Type"]), grades], axis=1)
-    for column in GRADE_COLUMNS:
-        if column not in frame.columns:
-            frame[column] = 0.0
-    return frame
-
-
-def chronological_split(
-    frame: pd.DataFrame,
-) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    """80% commission / 15% historical validation / 5% unseen live stream."""
-    count = len(frame)
-    train_end = int(count * 0.80)
-    validation_end = int(count * 0.95)
-    return (
-        frame.iloc[:train_end].copy(),
-        frame.iloc[train_end:validation_end].copy(),
-        frame.iloc[validation_end:].copy(),
-    )
-
-
-def legacy_rule_engine_score(frame: pd.DataFrame) -> np.ndarray:
-    """Continuous score from the fixed overstrain, heat, power, and wear limits."""
-    torque = frame["Torque [Nm]"].to_numpy(dtype=float)
-    speed = frame["Rotational speed [rpm]"].to_numpy(dtype=float)
-    wear = frame["Tool wear [min]"].to_numpy(dtype=float)
-    thermal = frame["Thermal_Stress_K"].to_numpy(dtype=float)
-    power_w = frame["Mechanical_Power_kW"].to_numpy(dtype=float) * 1000.0
-
-    threshold = np.full(len(frame), 12000.0)
-    if "Type_L" in frame.columns:
-        threshold = np.where(frame["Type_L"].to_numpy(dtype=float) == 1.0, 11000.0, threshold)
-    if "Type_H" in frame.columns:
-        threshold = np.where(frame["Type_H"].to_numpy(dtype=float) == 1.0, 13000.0, threshold)
-
-    overstrain = np.clip((wear * torque) / threshold, 0.0, 1.5) / 1.5
-    heat = np.clip((8.6 - thermal) / 8.6, 0.0, 1.0) * np.clip(
-        (1380.0 - speed) / 1380.0, 0.0, 1.0
-    )
-    power_risk = np.maximum(
-        np.clip((3500.0 - power_w) / 3500.0, 0.0, 1.0),
-        np.clip((power_w - 9000.0) / 9000.0, 0.0, 1.0),
-    )
-    wear_risk = np.clip((wear - 150.0) / 90.0, 0.0, 1.0)
-    return np.clip(np.vstack([overstrain, heat, power_risk, wear_risk]).max(axis=0), 0.0, 1.0)
-
-
-def chronological_folds(n_samples: int) -> list[tuple[np.ndarray, np.ndarray]]:
-    """Partition cycles into contiguous blocks.
-
-    Later blocks are scored only from earlier cycles. The opening block is
-    scored from the following block so every cycle still receives one
-    out-of-fold score, which stacking requires.
-    """
-    edges = [
-        0,
-        *(int(n_samples * fraction) for fraction in (OPENING_BLOCK, 0.50, 0.75)),
-        n_samples,
-    ]
-    if len(set(edges)) != len(edges):
-        raise RuntimeError("Not enough cycles to build chronological folds.")
-
-    opening_train = np.arange(edges[1], edges[2])
-    opening_test = np.arange(edges[0], edges[1])
-    folds = [(opening_train, opening_test)]
-    for index in range(1, 4):
-        train_index = np.arange(0, edges[index])
-        test_index = np.arange(edges[index], edges[index + 1])
-        folds.append((train_index, test_index))
-    return folds
-
-
-def build_pipeline(
-    scale_pos_weight: float,
-    folds: list[tuple[np.ndarray, np.ndarray]],
-) -> Pipeline:
-    trees = XGBClassifier(
-        objective="binary:logistic",
-        eval_metric="logloss",
-        n_estimators=300,
-        max_depth=3,
-        learning_rate=0.05,
-        subsample=0.85,
-        colsample_bytree=0.8,
-        min_child_weight=5,
-        max_delta_step=1,
-        reg_lambda=1.0,
-        scale_pos_weight=scale_pos_weight,
-        random_state=42,
-        n_jobs=-1,
-        verbosity=0,
-    )
-    geometric = SVC(
-        kernel="rbf",
-        probability=True,
-        class_weight="balanced",
-        random_state=42,
-        cache_size=2000,
-    )
-    deep = MLPClassifier(
-        hidden_layer_sizes=(64, 32),
-        max_iter=200,
-        random_state=42,
-    )
-    core = StackingClassifier(
-        estimators=[
-            ("trees", trees),
-            ("geometric", geometric),
-            ("deep", deep),
-        ],
-        final_estimator=OpeningBlockLogisticRegression(
-            class_weight="balanced",
-            max_iter=1000,
-            random_state=42,
-        ),
-        stack_method="predict_proba",
-        cv=folds,
-        n_jobs=1,
-        passthrough=False,
-    )
-    return Pipeline(
-        [
-            ("scaler", StandardScaler()),
-            ("core", core),
-        ]
-    )
+    return rows
 
 
 def main() -> None:
     started = time.perf_counter()
-    cycles = load_cycles(RAW_PATH)
-    cycles = add_physics(cycles)
-    cycles = add_horizon_target(cycles)
-    cycles = encode_variant(cycles)
-
-    missing = [column for column in FEATURE_COLUMNS if column not in cycles.columns]
-    if missing:
-        raise RuntimeError(f"Process parameters missing after engineering: {missing}")
-
-    train, validation, holdout = chronological_split(cycles)
-    leaked = [column for column in EVENT_FLAG_COLUMNS if column in FEATURE_COLUMNS]
-    if leaked:
-        raise RuntimeError(f"Event flags leaked into process parameters: {leaked}")
-
-    STREAM_PATH.parent.mkdir(parents=True, exist_ok=True)
-    holdout[["Cycle_ID", *FEATURE_COLUMNS]].to_csv(STREAM_PATH, index=False)
-
-    x_train = train[FEATURE_COLUMNS].astype(float)
-    y_train = train["Target_Next_5_Cycles"].astype(int)
-    x_validation = validation[FEATURE_COLUMNS].astype(float)
-    y_validation = validation["Target_Next_5_Cycles"].astype(int)
+    frame = prepare(HORIZON)
+    train, validation, holdout = chronological_split(frame)
+    x_train, y_train = matrices(train)
+    x_validation, y_validation = matrices(validation)
+    x_holdout, y_holdout = matrices(holdout)
 
     positive = int((y_train == 1).sum())
-    negative = int((y_train == 0).sum())
     if positive == 0:
-        raise RuntimeError("The commissioning window has no impending-failure cycles.")
-    scale_pos_weight = negative / positive
+        raise RuntimeError("The training window has no impending-failure cycles.")
+    scale_pos_weight = float((y_train == 0).sum() / positive)
+    folds = chronological_folds(len(x_train))
+
+    STREAM_PATH.parent.mkdir(parents=True, exist_ok=True)
+    stream = holdout[["Cycle_ID", *FEATURE_COLUMNS, "Machine failure", "Failure_Mode"]].rename(
+        columns={"Machine failure": "Failure_Event"}
+    )
+    stream.to_csv(STREAM_PATH, index=False)
 
     print(
-        f"Cycles ready | train {len(train)} | validation {len(validation)} | "
-        f"holdout {len(holdout)} | scale_pos_weight {scale_pos_weight:.3f}"
+        f"Horizon {HORIZON} | train {len(train)} | validation {len(validation)} | holdout {len(holdout)} "
+        f"| positive rate {y_train.mean():.3f} | scale_pos_weight {scale_pos_weight:.3f}"
     )
-    print("Fitting horizon stacking pipeline...")
+    print("Tuning base learners with forward-chaining folds...")
+    tuned, tuning = tune_base_learners(x_train, y_train, folds, scale_pos_weight)
+    trees = clone(tuned["XGBoost"])
+    geometric = clone(tuned["SVM (RBF)"])
 
-    pipeline = build_pipeline(scale_pos_weight, chronological_folds(len(x_train)))
-    pipeline.fit(x_train, y_train)
+    print("Selecting the meta-learner window...")
+    stack, ignore_fraction = select_blend_window(trees, geometric, folds, x_train, y_train, x_validation, y_validation)
 
-    core_scores = pipeline.predict_proba(x_validation)[:, 1]
-    legacy_scores = legacy_rule_engine_score(validation)
-    core_precision, core_recall, _ = precision_recall_curve(y_validation, core_scores)
-    legacy_precision, legacy_recall, _ = precision_recall_curve(y_validation, legacy_scores)
-    core_ap = float(average_precision_score(y_validation, core_scores))
-    legacy_ap = float(average_precision_score(y_validation, legacy_scores))
-    recall_marks = np.array([0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8])
+    stack_validation = positive_scores(stack, x_validation)
+    stack_holdout = positive_scores(stack, x_holdout)
+    legacy_validation = legacy_rule_engine_score(validation)
+    legacy_holdout = legacy_rule_engine_score(holdout)
 
-    def _precision_at(recall: np.ndarray, precision: np.ndarray) -> np.ndarray:
-        order = np.argsort(recall)
-        return np.interp(recall_marks, recall[order], precision[order])
-
-    core_at = _precision_at(core_recall, core_precision)
-    legacy_at = _precision_at(legacy_recall, legacy_precision)
-    print("Blend coefficients:", pipeline.named_steps["core"].final_estimator_.coef_)
-    print("Precision across the operating range:")
-    for mark, core_value, legacy_value in zip(recall_marks, core_at, legacy_at):
-        print(f"  recall {mark:.1f} | core {core_value:.3f} | legacy {legacy_value:.3f}")
-    if core_ap <= legacy_ap or float(np.mean(core_at - legacy_at)) < 0.03:
+    comparison = {
+        STACK_NAME: {
+            "validation": summarize(y_validation, stack_validation),
+            "holdout": summarize(y_holdout, stack_holdout),
+        },
+        LEGACY_NAME: {
+            "validation": summarize(y_validation, legacy_validation),
+            "holdout": summarize(y_holdout, legacy_holdout),
+        },
+    }
+    core_ap = comparison[STACK_NAME]["validation"]["average_precision"]
+    legacy_ap = comparison[LEGACY_NAME]["validation"]["average_precision"]
+    if core_ap <= legacy_ap:
         raise RuntimeError(
-            "Autonomous diagnostic core did not clearly outperform the legacy rule engine "
-            f"on historical validation ({core_ap:.3f} vs {legacy_ap:.3f})."
+            f"Stacked ensemble did not outperform the legacy rule engine on validation ({core_ap:.3f} vs {legacy_ap:.3f})."
         )
 
-    power = x_train["Mechanical_Power_kW"].to_numpy(dtype=float)
-    pipeline.feature_columns_ = list(FEATURE_COLUMNS)
-    pipeline.power_reference_mean_ = float(power.mean())
-    pipeline.power_reference_std_ = float(power.std(ddof=0))
-    pipeline.power_reference_z_edges_ = POWER_Z_EDGES
-    pipeline.power_reference_expected_ = np.diff(norm.cdf(POWER_Z_EDGES))
-    pipeline.historical_precision_core_ = np.asarray(core_precision, dtype=float)
-    pipeline.historical_recall_core_ = np.asarray(core_recall, dtype=float)
-    pipeline.historical_precision_legacy_ = np.asarray(legacy_precision, dtype=float)
-    pipeline.historical_recall_legacy_ = np.asarray(legacy_recall, dtype=float)
+    warning, critical = thresholds_for(y_validation, stack_validation)
+    legacy_warning = best_threshold(y_validation, legacy_validation, beta=2.0)
+    policy = select_alert_policy(stack_validation, validation["Machine failure"].to_numpy(), warning, critical, HORIZON)
+    alerts = {
+        "policy": policy.as_dict(),
+        "validation": alert_summary(stack_validation, validation["Machine failure"].to_numpy(), policy, HORIZON),
+        "holdout": alert_summary(stack_holdout, holdout["Machine failure"].to_numpy(), policy, HORIZON),
+    }
 
-    influence = np.asarray(
-        pipeline.named_steps["core"].named_estimators_["trees"].feature_importances_,
-        dtype=float,
-    )
-    if influence.shape[0] != len(FEATURE_COLUMNS):
-        raise RuntimeError(
-            f"Influence width {influence.shape[0]} does not match "
-            f"{len(FEATURE_COLUMNS)} process parameters."
-        )
+    print("Horizon study...")
+    horizons = horizon_study(trees, geometric, policy, stack, ignore_fraction)
 
-    holdout_scores = pipeline.predict_proba(holdout[FEATURE_COLUMNS].astype(float))
-    if holdout_scores.ndim != 2 or holdout_scores.shape[1] != 2:
-        raise RuntimeError(f"Unexpected score shape {holdout_scores.shape}")
+    power_edges = quantile_edges(train["Mechanical_Power_kW"].to_numpy(dtype=float), bins=4)
+    stack.feature_columns_ = list(FEATURE_COLUMNS)
+    stack.horizon_ = HORIZON
+    stack.alert_policy_ = policy.as_dict()
+    stack.power_edges_ = power_edges
+    stack.power_expected_ = np.full(4, 0.25)
+    stack.trained_at_ = datetime.now().isoformat(timespec="seconds")
 
     MODEL_PATH.parent.mkdir(parents=True, exist_ok=True)
-    joblib.dump(pipeline, MODEL_PATH)
-
-    restored = joblib.load(MODEL_PATH)
-    required = [
-        "feature_columns_",
-        "power_reference_mean_",
-        "power_reference_std_",
-        "power_reference_z_edges_",
-        "power_reference_expected_",
-        "historical_precision_core_",
-        "historical_recall_core_",
-        "historical_precision_legacy_",
-        "historical_recall_legacy_",
-    ]
-    missing_attrs = [name for name in required if not hasattr(restored, name)]
-    if missing_attrs:
-        raise RuntimeError(f"Serialized core is missing {missing_attrs}")
-
-    import subprocess
-    import sys
-
+    joblib.dump(stack, MODEL_PATH)
     probe = subprocess.run(
-        [
-            sys.executable,
-            "-c",
-            "import joblib, sys; joblib.load(sys.argv[1])",
-            str(MODEL_PATH),
-        ],
+        [sys.executable, "-c", "import joblib, sys; joblib.load(sys.argv[1])", str(MODEL_PATH)],
         cwd=ROOT,
         capture_output=True,
         text=True,
         check=False,
     )
     if probe.returncode != 0:
-        raise RuntimeError(f"Serialized core cannot be reloaded:\n{probe.stderr}")
+        raise RuntimeError(f"Serialized model cannot be reloaded:\n{probe.stderr}")
 
-    ranking = sorted(
-        zip(FEATURE_COLUMNS, influence),
-        key=lambda item: item[1],
-        reverse=True,
-    )
-    print("Process parameter influence:")
-    for name, weight in ranking:
-        print(f"  {name}: {weight:.4f}")
-    print(
-        "Historical average precision | "
-        f"core {core_ap:.3f} | "
-        f"legacy {legacy_ap:.3f}"
-    )
+    report = {
+        "generated_at": stack.trained_at_,
+        "horizon": HORIZON,
+        "features": list(FEATURE_COLUMNS),
+        "scale_pos_weight": scale_pos_weight,
+        "splits": {
+            "train": split_summary(train),
+            "validation": split_summary(validation),
+            "holdout": split_summary(holdout),
+        },
+        "tuning": tuning,
+        "ignore_fraction": ignore_fraction,
+        "comparison": comparison,
+        "curves": {STACK_NAME: pr_curve(y_holdout, stack_holdout), LEGACY_NAME: pr_curve(y_holdout, legacy_holdout)},
+        "thresholds": {"warning": warning, "critical": critical},
+        "confusion": {
+            STACK_NAME: at_threshold(y_holdout, stack_holdout, warning),
+            LEGACY_NAME: at_threshold(y_holdout, legacy_holdout, legacy_warning),
+        },
+        "alerts": alerts,
+        "horizons": horizons,
+    }
+    report["duration_s"] = time.perf_counter() - started
+    REPORT_PATH.write_text(json.dumps(report, indent=1, default=plain), encoding="utf-8")
+
+    for name, entry in comparison.items():
+        print(
+            f"{name:20s} | validation AP {entry['validation']['average_precision']:.3f} "
+            f"| holdout AP {entry['holdout']['average_precision']:.3f} ROC-AUC {entry['holdout']['roc_auc']:.3f}"
+        )
+    print(f"Thresholds | warning {warning:.3f} | critical {critical:.3f}")
+    print(f"Alert policy | {policy.as_dict()}")
+    for split in ("validation", "holdout"):
+        raw, checked = alerts[split]["raw"], alerts[split]["validated"]
+        print(
+            f"  {split:10s} raw: warned {raw['warned']}/{raw['failure_events']} false {raw['false_episodes']} "
+            f"changes {raw['state_changes']} | validated: warned {checked['warned']}/{checked['failure_events']} "
+            f"false {checked['false_episodes']} changes {checked['state_changes']} lead {checked['mean_lead_cycles']:.1f}"
+        )
     print(f"Saved {MODEL_PATH}")
+    print(f"Saved {REPORT_PATH}")
     print(f"Saved {STREAM_PATH}")
-    print(f"Commissioned in {time.perf_counter() - started:.1f}s")
+    print(f"Completed in {report['duration_s']:.1f}s")
 
 
 if __name__ == "__main__":
